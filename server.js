@@ -5,6 +5,11 @@ const express    = require("express");
 const crypto     = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
 
+// Polyfill fetch for Node 18 compatibility
+if (!globalThis.fetch) {
+  globalThis.fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
+}
+
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
@@ -20,6 +25,44 @@ app.use(express.json());
 
 // ── Health check ─────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "Chowli backend running" }));
+
+// ── Debug: check if FCM token exists for a user ──────────────
+app.get("/debug/token/:userId", async (req, res) => {
+  const { data } = await supabase
+    .from("profiles")
+    .select("id, full_name, fcm_token")
+    .eq("id", req.params.userId)
+    .single();
+  if (!data) return res.json({ found: false });
+  res.json({
+    found: true,
+    name: data.full_name,
+    hasToken: !!data.fcm_token,
+    tokenPreview: data.fcm_token ? data.fcm_token.slice(0, 20) + "..." : null,
+  });
+});
+
+// ── Debug: send a test notification to a user ────────────────
+app.get("/debug/notify/:userId", async (req, res) => {
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("fcm_token, full_name")
+    .eq("id", req.params.userId)
+    .single();
+
+  if (!profile?.fcm_token) {
+    return res.json({ sent: false, reason: "No FCM token saved for this user" });
+  }
+
+  const result = await sendPushNotification({
+    token: profile.fcm_token,
+    title: "Test notification 🎉",
+    body: "Chowli push notifications are working!",
+    data: { type: "test" },
+  });
+
+  res.json({ sent: true, result });
+});
 
 // ════════════════════════════════════════════════════════════
 //  PAYSTACK WEBHOOK
