@@ -3,6 +3,7 @@
 
 const express    = require("express");
 const crypto     = require("crypto");
+const cors       = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
 // Polyfill fetch for Node 18 compatibility
@@ -12,6 +13,17 @@ if (!globalThis.fetch) {
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// ── CORS — allow requests from your Vercel frontend ──────────
+app.use(cors({
+  origin: [
+    "https://mesa-bice.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:4173",
+  ],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-chowli-secret"],
+}));
 
 // ── Supabase admin client (bypasses RLS) ─────────────────────
 const supabase = createClient(
