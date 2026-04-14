@@ -40,6 +40,9 @@ app.get("/", (req, res) => res.json({ status: "Chowli backend running" }));
 
 // ── Debug: check if FCM token exists for a user ──────────────
 app.get("/debug/token/:userId", async (req, res) => {
+  if (req.headers["x-chowli-secret"] !== process.env.CHOWLI_INTERNAL_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   const { data } = await supabase
     .from("profiles")
     .select("id, full_name, fcm_token")
@@ -56,6 +59,9 @@ app.get("/debug/token/:userId", async (req, res) => {
 
 // ── Debug: send a test notification to a user ────────────────
 app.get("/debug/notify/:userId", async (req, res) => {
+  if (req.headers["x-chowli-secret"] !== process.env.CHOWLI_INTERNAL_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
   const { data: profile } = await supabase
     .from("profiles")
     .select("fcm_token, full_name")
@@ -216,6 +222,8 @@ app.post("/notify/order-status", async (req, res) => {
     confirmed:  { title: "Order confirmed! ✅", body: "Your order has been confirmed. Sit tight!" },
     preparing:  { title: "Order being prepared 👨‍🍳", body: "The kitchen is working on your order." },
     ready:      { title: "Order ready! 🎉", body: "Your order is ready for pickup/delivery!" },
+    completed:  { title: "Order completed ✓", body: "Your order has been completed. Enjoy!" },
+    delivered:  { title: "Order delivered! 🛵", body: "Your order has been delivered. Enjoy!" },
     cancelled:  { title: "Order cancelled", body: "Your order was cancelled. Contact the restaurant for details." },
   };
 
@@ -228,6 +236,46 @@ app.post("/notify/order-status", async (req, res) => {
     body: msg.body,
     data: { type: "order_status", order_id: orderId, status },
   });
+
+  res.json({ sent: true });
+});
+
+// ── Notify restaurant owner when a cash order is placed ──────
+// Called by the frontend immediately after a cash order is saved to Supabase.
+// (Online orders are notified via the Paystack charge.success webhook instead.)
+app.post("/notify/new-order", async (req, res) => {
+  console.log("[/notify/new-order] hit — body:", req.body);
+  const { orderId, restaurantId } = req.body;
+  if (!orderId || !restaurantId) {
+    console.warn("[/notify/new-order] missing orderId or restaurantId");
+    return res.status(400).json({ error: "Missing orderId or restaurantId" });
+  }
+
+  console.log("[/notify/new-order] looking up restaurant:", restaurantId);
+  const { data: restaurant, error: rErr } = await supabase
+    .from("restaurants")
+    .select("owner_id, name")
+    .eq("id", restaurantId)
+    .single();
+  console.log("[/notify/new-order] restaurant result:", restaurant, rErr?.message);
+  if (!restaurant) return res.json({ sent: false, reason: "Restaurant not found" });
+
+  console.log("[/notify/new-order] looking up owner profile:", restaurant.owner_id);
+  const { data: profile, error: pErr } = await supabase
+    .from("profiles")
+    .select("fcm_token")
+    .eq("id", restaurant.owner_id)
+    .single();
+  console.log("[/notify/new-order] profile result — hasToken:", !!profile?.fcm_token, pErr?.message);
+  if (!profile?.fcm_token) return res.json({ sent: false, reason: "No FCM token for owner" });
+
+  const fcmResult = await sendPushNotification({
+    token: profile.fcm_token,
+    title: "New order received! 💰",
+    body:  `A customer placed a cash order at ${restaurant.name}`,
+    data:  { type: "new_order", order_id: String(orderId) },
+  });
+  console.log("[/notify/new-order] FCM result:", JSON.stringify(fcmResult));
 
   res.json({ sent: true });
 });
