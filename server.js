@@ -364,12 +364,16 @@ app.post("/notify/whatsapp", async (req, res) => {
   const shortId = String(orderId).slice(0, 8).toUpperCase();
 
   const body = [
-    `🍽️ New Chowli Order!`,
+    `🍽️ New Order on Chowli!`,
+    ``,
     `Customer: ${customerName}`,
     `Items: ${itemsSummary}`,
     `Total: ₦${total}`,
     `Type: ${fulfillmentLabel}`,
     `Order #${shortId}`,
+    ``,
+    `👆 Open Chowli now to confirm or cancel this order:`,
+    `https://mesa-bice.vercel.app`,
   ].join("\n");
 
   try {
