@@ -1,10 +1,19 @@
 // server.js — Chowli Backend (Railway)
-// Handles: Paystack webhooks, FCM push notifications, scheduled cleanup
+// Handles: Paystack webhooks, FCM push notifications, WhatsApp notifications, scheduled cleanup
 
 const express    = require("express");
 const crypto     = require("crypto");
 const cors       = require("cors");
+const cron       = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
+
+// Lazy Twilio client — only initialised if env vars are present
+function getTwilioClient() {
+  const sid   = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return null;
+  return require("twilio")(sid, token);
+}
 
 // Polyfill fetch for Node 18 compatibility
 if (!globalThis.fetch) {
@@ -280,6 +289,90 @@ app.post("/notify/new-order", async (req, res) => {
   res.json({ sent: true });
 });
 
+// ── WhatsApp order notification (cash orders) ────────────────
+// Called by the frontend after a cash order is saved to Supabase.
+// Looks up owner phone from profiles and sends a WhatsApp message via Twilio.
+app.post("/notify/whatsapp", async (req, res) => {
+  const { orderId, restaurantId } = req.body;
+  if (!orderId || !restaurantId) {
+    return res.status(400).json({ error: "Missing orderId or restaurantId" });
+  }
+
+  // Fetch order details (subtotal, fulfillment, customer)
+  const { data: order } = await supabase
+    .from("orders")
+    .select("id, subtotal, fulfillment, customer_id, order_items(name, quantity)")
+    .eq("id", orderId)
+    .single();
+
+  if (!order) return res.json({ sent: false, reason: "Order not found" });
+
+  // Get customer name
+  const { data: customer } = await supabase
+    .from("profiles")
+    .select("full_name")
+    .eq("id", order.customer_id)
+    .single();
+
+  // Get restaurant owner
+  const { data: restaurant } = await supabase
+    .from("restaurants")
+    .select("owner_id, name")
+    .eq("id", restaurantId)
+    .single();
+
+  if (!restaurant) return res.json({ sent: false, reason: "Restaurant not found" });
+
+  // Get owner phone
+  const { data: owner } = await supabase
+    .from("profiles")
+    .select("phone")
+    .eq("id", restaurant.owner_id)
+    .single();
+
+  const ownerPhone = owner?.phone;
+  if (!ownerPhone) {
+    console.warn("[whatsapp] owner has no phone number — skipping");
+    return res.json({ sent: false, reason: "Owner has no phone number" });
+  }
+
+  const client = getTwilioClient();
+  if (!client) {
+    console.warn("[whatsapp] Twilio not configured — skipping");
+    return res.json({ sent: false, reason: "Twilio not configured" });
+  }
+
+  const customerName = customer?.full_name || "A customer";
+  const itemsSummary = (order.order_items || [])
+    .map(i => `${i.name} x${i.quantity}`)
+    .join(", ") || "items";
+  const total = Number(order.subtotal || 0).toLocaleString("en-NG");
+  const fulfillmentLabel = order.fulfillment === "delivery" ? "Delivery" : "Pickup";
+  const shortId = String(orderId).slice(0, 8).toUpperCase();
+
+  const body = [
+    `🍽️ New Chowli Order!`,
+    `Customer: ${customerName}`,
+    `Items: ${itemsSummary}`,
+    `Total: ₦${total}`,
+    `Type: ${fulfillmentLabel}`,
+    `Order #${shortId}`,
+  ].join("\n");
+
+  try {
+    await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886",
+      to:   `whatsapp:${ownerPhone}`,
+      body,
+    });
+    console.log(`[whatsapp] sent to ${ownerPhone} for order ${shortId}`);
+    res.json({ sent: true });
+  } catch (err) {
+    console.error("[whatsapp] send failed:", err.message);
+    res.json({ sent: false, reason: err.message });
+  }
+});
+
 // ── Save FCM token for a user ────────────────────────────────
 app.post("/fcm/save-token", async (req, res) => {
   const { userId, token } = req.body;
@@ -291,6 +384,59 @@ app.post("/fcm/save-token", async (req, res) => {
     .eq("id", userId);
 
   res.json({ saved: true });
+});
+
+// ════════════════════════════════════════════════════════════
+//  CRON JOBS
+// ════════════════════════════════════════════════════════════
+
+// Auto-cancel orders that have been 'pending' for more than 15 minutes.
+// Runs every 5 minutes.
+cron.schedule("*/5 * * * *", async () => {
+  const cutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  console.log(`[cron/auto-cancel] checking for stale pending orders (older than ${cutoff})`);
+
+  const { data: stale, error } = await supabase
+    .from("orders")
+    .select("id, customer_id")
+    .eq("status", "pending")
+    .lt("created_at", cutoff);
+
+  if (error) { console.error("[cron/auto-cancel] query error:", error.message); return; }
+  if (!stale?.length) { console.log("[cron/auto-cancel] no stale orders found"); return; }
+
+  console.log(`[cron/auto-cancel] cancelling ${stale.length} order(s)`);
+
+  for (const order of stale) {
+    // Update status to cancelled
+    const { error: updateErr } = await supabase
+      .from("orders")
+      .update({ status: "cancelled" })
+      .eq("id", order.id);
+
+    if (updateErr) {
+      console.error(`[cron/auto-cancel] failed to cancel order ${order.id}:`, updateErr.message);
+      continue;
+    }
+
+    // Push notification to customer
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("fcm_token")
+      .eq("id", order.customer_id)
+      .single();
+
+    if (profile?.fcm_token) {
+      await sendPushNotification({
+        token: profile.fcm_token,
+        title: "Order cancelled ⏱️",
+        body:  "Your order was cancelled because the restaurant didn't respond in time.",
+        data:  { type: "order_status", order_id: String(order.id), status: "cancelled" },
+      });
+    }
+
+    console.log(`[cron/auto-cancel] cancelled order ${order.id}`);
+  }
 });
 
 // ════════════════════════════════════════════════════════════
