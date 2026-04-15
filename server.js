@@ -330,11 +330,24 @@ app.post("/notify/whatsapp", async (req, res) => {
     .eq("id", restaurant.owner_id)
     .single();
 
-  const ownerPhone = owner?.phone;
-  if (!ownerPhone) {
+  const rawPhone = owner?.phone;
+  if (!rawPhone) {
     console.warn("[whatsapp] owner has no phone number — skipping");
     return res.json({ sent: false, reason: "Owner has no phone number" });
   }
+
+  // Normalize to E.164 international format required by Twilio
+  let ownerPhone;
+  if (rawPhone.startsWith("+")) {
+    ownerPhone = rawPhone;
+  } else if (rawPhone.startsWith("234")) {
+    ownerPhone = `+${rawPhone}`;
+  } else if (rawPhone.startsWith("0")) {
+    ownerPhone = `+234${rawPhone.slice(1)}`;
+  } else {
+    ownerPhone = `+234${rawPhone}`;
+  }
+  console.log(`[whatsapp] normalized phone: ${rawPhone} → ${ownerPhone}`);
 
   const client = getTwilioClient();
   if (!client) {
