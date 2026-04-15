@@ -15,6 +15,23 @@ function getTwilioClient() {
   return require("twilio")(sid, token);
 }
 
+// Format a UTC ISO timestamp into a human-readable local label, e.g. "Today at 1:00 PM"
+function formatScheduledTime(isoString) {
+  const d = new Date(isoString);
+  const now = new Date();
+  const isToday = d.toDateString() === now.toDateString();
+  const tom = new Date(now); tom.setDate(now.getDate() + 1);
+  const isTomorrow = d.toDateString() === tom.toDateString();
+  const dayLabel = isToday ? "Today" : isTomorrow ? "Tomorrow"
+    : d.toLocaleDateString("en-NG", { weekday: "long", month: "short", day: "numeric" });
+  const h = d.getHours();
+  const m = d.getMinutes();
+  const suffix = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 || 12;
+  const timeStr = `${h12}:${String(m).padStart(2, "0")} ${suffix}`;
+  return `${dayLabel} at ${timeStr}`;
+}
+
 // Polyfill fetch for Node 18 compatibility
 if (!globalThis.fetch) {
   globalThis.fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
@@ -260,6 +277,13 @@ app.post("/notify/new-order", async (req, res) => {
     return res.status(400).json({ error: "Missing orderId or restaurantId" });
   }
 
+  // Fetch order to check for scheduled_time
+  const { data: order } = await supabase
+    .from("orders")
+    .select("scheduled_time")
+    .eq("id", orderId)
+    .single();
+
   console.log("[/notify/new-order] looking up restaurant:", restaurantId);
   const { data: restaurant, error: rErr } = await supabase
     .from("restaurants")
@@ -278,10 +302,11 @@ app.post("/notify/new-order", async (req, res) => {
   console.log("[/notify/new-order] profile result — hasToken:", !!profile?.fcm_token, pErr?.message);
   if (!profile?.fcm_token) return res.json({ sent: false, reason: "No FCM token for owner" });
 
+  const scheduledLabel = order?.scheduled_time ? ` (Scheduled: ${formatScheduledTime(order.scheduled_time)})` : "";
   const fcmResult = await sendPushNotification({
     token: profile.fcm_token,
     title: "New order received! 💰",
-    body:  `A customer placed a cash order at ${restaurant.name}`,
+    body:  `A customer placed a cash order at ${restaurant.name}${scheduledLabel}`,
     data:  { type: "new_order", order_id: String(orderId) },
   });
   console.log("[/notify/new-order] FCM result:", JSON.stringify(fcmResult));
@@ -298,10 +323,10 @@ app.post("/notify/whatsapp", async (req, res) => {
     return res.status(400).json({ error: "Missing orderId or restaurantId" });
   }
 
-  // Fetch order details (subtotal, fulfillment, customer)
+  // Fetch order details (subtotal, fulfillment, customer, scheduled_time)
   const { data: order } = await supabase
     .from("orders")
-    .select("id, subtotal, fulfillment, customer_id, order_items(name, quantity)")
+    .select("id, subtotal, fulfillment, customer_id, scheduled_time, order_items(name, quantity)")
     .eq("id", orderId)
     .single();
 
@@ -363,6 +388,10 @@ app.post("/notify/whatsapp", async (req, res) => {
   const fulfillmentLabel = order.fulfillment === "delivery" ? "Delivery" : "Pickup";
   const shortId = String(orderId).slice(0, 8).toUpperCase();
 
+  const scheduledLine = order.scheduled_time
+    ? `⏰ Scheduled for: ${formatScheduledTime(order.scheduled_time)}`
+    : null;
+
   const body = [
     `🍽️ New Order on Chowli!`,
     ``,
@@ -370,11 +399,12 @@ app.post("/notify/whatsapp", async (req, res) => {
     `Items: ${itemsSummary}`,
     `Total: ₦${total}`,
     `Type: ${fulfillmentLabel}`,
+    scheduledLine,
     `Order #${shortId}`,
     ``,
     `👆 Open Chowli now to confirm or cancel this order:`,
     `https://mesa-bice.vercel.app`,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   try {
     await client.messages.create({
