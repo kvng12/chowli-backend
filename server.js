@@ -59,6 +59,8 @@ const supabase = createClient(
 
 // ── Raw body for Paystack signature verification ─────────────
 app.use("/webhooks/paystack", express.raw({ type: "application/json" }));
+// Twilio sends form-encoded bodies; express.json() won't parse them.
+// The /webhooks/twilio route uses its own express.urlencoded() inline.
 app.use(express.json());
 
 // ── Health check ─────────────────────────────────────────────
@@ -418,6 +420,143 @@ app.post("/notify/whatsapp", async (req, res) => {
     console.error("[whatsapp] send failed:", err.message);
     res.json({ sent: false, reason: err.message });
   }
+});
+
+// ════════════════════════════════════════════════════════════
+//  WHATSAPP CUSTOMER ORDER CONFIRMATION (fraud check)
+// ════════════════════════════════════════════════════════════
+
+// In-memory map: normalizedPhone → { orderId, timer }
+// Persists only for the lifetime of this process; cron job at 15 min catches restarts.
+const pendingConfirmations = new Map();
+
+function normalizePhone(raw) {
+  if (!raw) return null;
+  if (raw.startsWith("+"))   return raw;
+  if (raw.startsWith("234")) return `+${raw}`;
+  if (raw.startsWith("0"))   return `+234${raw.slice(1)}`;
+  return `+234${raw}`;
+}
+
+async function cancelOrder(orderId, reason) {
+  const { error } = await supabase
+    .from("orders")
+    .update({ status: "cancelled" })
+    .eq("id", orderId)
+    .eq("status", "pending"); // only cancel if still pending
+  if (!error) console.log(`[whatsapp-confirm] auto-cancelled order ${orderId}: ${reason}`);
+}
+
+// Called by frontend after a cash order is placed.
+// Sends customer WhatsApp asking YES/NO and sets a 10-min auto-cancel timer.
+app.post("/notify/whatsapp-customer", async (req, res) => {
+  const { orderId, customerId } = req.body;
+  if (!orderId || !customerId) return res.status(400).json({ error: "Missing orderId or customerId" });
+
+  const { data: order } = await supabase
+    .from("orders")
+    .select("id, subtotal, restaurant_id")
+    .eq("id", orderId)
+    .single();
+  if (!order) return res.json({ sent: false, reason: "Order not found" });
+
+  const { data: customer } = await supabase
+    .from("profiles")
+    .select("full_name, phone")
+    .eq("id", customerId)
+    .single();
+
+  const { data: restaurant } = await supabase
+    .from("restaurants")
+    .select("name")
+    .eq("id", order.restaurant_id)
+    .single();
+
+  const rawPhone = customer?.phone;
+  if (!rawPhone) {
+    console.warn(`[whatsapp-confirm] customer ${customerId} has no phone — skipping`);
+    return res.json({ sent: false, reason: "Customer has no phone number" });
+  }
+
+  const customerPhone = normalizePhone(rawPhone);
+  const client        = getTwilioClient();
+  if (!client) {
+    console.warn("[whatsapp-confirm] Twilio not configured — skipping");
+    return res.json({ sent: false, reason: "Twilio not configured" });
+  }
+
+  const name   = customer?.full_name || "there";
+  const amount = Number(order.subtotal || 0).toLocaleString("en-NG");
+  const rname  = restaurant?.name || "the restaurant";
+  const body   = [
+    `Hi ${name}! 👋`,
+    ``,
+    `You just placed a cash order of ₦${amount} from ${rname} on Chowli.`,
+    ``,
+    `Reply *YES* to confirm or *NO* to cancel.`,
+    `No reply in 10 minutes = auto-cancel.`,
+  ].join("\n");
+
+  try {
+    await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886",
+      to:   `whatsapp:${customerPhone}`,
+      body,
+    });
+    console.log(`[whatsapp-confirm] sent to ${customerPhone} for order ${orderId}`);
+
+    // Clear any previous timer for this phone
+    const existing = pendingConfirmations.get(customerPhone);
+    if (existing?.timer) clearTimeout(existing.timer);
+
+    // 10-minute auto-cancel timer
+    const timer = setTimeout(() => {
+      console.log(`[whatsapp-confirm] no reply from ${customerPhone} — cancelling order ${orderId}`);
+      cancelOrder(orderId, "no WhatsApp reply in 10 minutes");
+      pendingConfirmations.delete(customerPhone);
+    }, 10 * 60 * 1000);
+
+    pendingConfirmations.set(customerPhone, { orderId, timer });
+    res.json({ sent: true });
+  } catch (err) {
+    console.error("[whatsapp-confirm] send failed:", err.message);
+    res.json({ sent: false, reason: err.message });
+  }
+});
+
+// ── Twilio incoming message webhook ─────────────────────────
+// Configure this URL in Twilio console: Messaging > WhatsApp Sandbox > "When a message comes in"
+// URL: https://your-railway-app.up.railway.app/webhooks/twilio
+app.post("/webhooks/twilio", express.urlencoded({ extended: false }), async (req, res) => {
+  const from = req.body?.From || "";  // e.g. "whatsapp:+2348012345678"
+  const body = (req.body?.Body || "").trim().toUpperCase();
+
+  console.log(`[twilio-webhook] from=${from} body="${body}"`);
+
+  // Normalise: strip "whatsapp:" prefix
+  const phone = from.replace(/^whatsapp:/, "");
+  const entry = pendingConfirmations.get(phone);
+
+  if (!entry) {
+    console.log(`[twilio-webhook] no pending confirmation for ${phone}`);
+    return res.status(200).send("<Response></Response>");
+  }
+
+  clearTimeout(entry.timer);
+  pendingConfirmations.delete(phone);
+
+  if (body === "YES" || body.startsWith("YES")) {
+    console.log(`[twilio-webhook] ${phone} confirmed order ${entry.orderId}`);
+    // No action needed — order remains pending, restaurant confirms it
+  } else if (body === "NO" || body.startsWith("NO")) {
+    console.log(`[twilio-webhook] ${phone} cancelled order ${entry.orderId}`);
+    await cancelOrder(entry.orderId, "customer replied NO on WhatsApp");
+  } else {
+    console.log(`[twilio-webhook] unrecognised reply "${body}" from ${phone} — treating as no-action`);
+  }
+
+  // TwiML empty response
+  res.status(200).type("text/xml").send("<Response></Response>");
 });
 
 // ── Save FCM token for a user ────────────────────────────────
