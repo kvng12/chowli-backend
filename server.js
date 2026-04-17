@@ -61,6 +61,8 @@ const AUTH_EXEMPT = [
   { method: "GET",  path: "/" },
   { method: "POST", path: "/webhooks/twilio" },
   { method: "POST", path: "/webhooks/paystack" },
+  { method: "POST", path: "/auth/send-otp" },
+  { method: "POST", path: "/auth/verify-otp" },
 ];
 app.use((req, res, next) => {
   const exempt = AUTH_EXEMPT.some(r => r.method === req.method && r.path === req.path);
@@ -701,6 +703,139 @@ cron.schedule("*/5 * * * *", async () => {
     } catch (notifyErr) {
       console.error(`[cron/auto-release] notification failed for ${orderId}:`, notifyErr.message);
     }
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+//  PHONE OTP — /auth/send-otp + /auth/verify-otp
+//  These endpoints are exempt from the API key check so the
+//  browser can call them before a session exists.
+// ════════════════════════════════════════════════════════════
+
+// In-memory OTP store  { phone → { code, expiresAt, attempts, lockedUntil } }
+const otpStore = new Map();
+
+const OTP_TTL_MS      = 10 * 60 * 1000;  // 10 minutes
+const OTP_MAX_ATTEMPTS = 3;
+const OTP_LOCK_MS     = 10 * 60 * 1000;  // 10-minute lock after 3 bad attempts
+
+function generateOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+// POST /auth/send-otp  { phone: "+2348012345678" }
+app.post("/auth/send-otp", async (req, res) => {
+  const { phone } = req.body || {};
+  if (!phone || !/^\+234[789][01]\d{8}$/.test(phone)) {
+    return res.status(400).json({ error: "Invalid Nigerian phone number" });
+  }
+
+  // Check if currently locked
+  const existing = otpStore.get(phone);
+  if (existing?.lockedUntil && Date.now() < existing.lockedUntil) {
+    const secs = Math.ceil((existing.lockedUntil - Date.now()) / 1000);
+    return res.status(429).json({ error: `Too many attempts. Try again in ${secs} seconds.`, lockedUntil: existing.lockedUntil });
+  }
+
+  const code = generateOtp();
+  otpStore.set(phone, {
+    code,
+    expiresAt:  Date.now() + OTP_TTL_MS,
+    attempts:   0,
+    lockedUntil: null,
+  });
+
+  console.log(`[OTP] Generated for ${phone}: ${code}`);
+
+  const client = getTwilioClient();
+  if (!client) {
+    console.warn("[OTP] Twilio not configured — code logged above but not sent");
+    // In dev without Twilio, still return success so the UI works
+    return res.json({ ok: true, dev: true });
+  }
+
+  const from = process.env.TWILIO_SMS_FROM || process.env.TWILIO_WHATSAPP_FROM?.replace("whatsapp:", "");
+  if (!from) {
+    console.warn("[OTP] TWILIO_SMS_FROM not set");
+    return res.json({ ok: true, dev: true });
+  }
+
+  try {
+    await client.messages.create({
+      from,
+      to: phone,
+      body: `Your Chowli verification code is: ${code}. Valid for 10 minutes. Do not share this code.`,
+    });
+    console.log(`[OTP] SMS sent to ${phone}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[OTP] Twilio send error:", err.message);
+    res.status(500).json({ error: "Failed to send SMS. Please try again." });
+  }
+});
+
+// POST /auth/verify-otp  { phone, code, userId }
+app.post("/auth/verify-otp", async (req, res) => {
+  const { phone, code, userId } = req.body || {};
+  if (!phone || !code || !userId) {
+    return res.status(400).json({ error: "Missing phone, code, or userId" });
+  }
+
+  const record = otpStore.get(phone);
+
+  if (!record) {
+    return res.status(400).json({ error: "No code was sent to this number. Please request a new code." });
+  }
+
+  // Locked?
+  if (record.lockedUntil && Date.now() < record.lockedUntil) {
+    const secs = Math.ceil((record.lockedUntil - Date.now()) / 1000);
+    return res.status(429).json({ error: `Too many attempts. Try again in ${secs} seconds.`, lockedUntil: record.lockedUntil });
+  }
+
+  // Expired?
+  if (Date.now() > record.expiresAt) {
+    otpStore.delete(phone);
+    return res.status(400).json({ error: "Code expired. Please request a new one." });
+  }
+
+  // Wrong code?
+  if (record.code !== String(code)) {
+    record.attempts += 1;
+    if (record.attempts >= OTP_MAX_ATTEMPTS) {
+      record.lockedUntil = Date.now() + OTP_LOCK_MS;
+      console.warn(`[OTP] ${phone} locked after ${OTP_MAX_ATTEMPTS} failed attempts`);
+      return res.status(400).json({
+        error: "Too many incorrect attempts. Please wait 10 minutes.",
+        attemptsLeft: 0,
+        lockedUntil: record.lockedUntil,
+      });
+    }
+    return res.status(400).json({
+      error: "Incorrect code. Please try again.",
+      attemptsLeft: OTP_MAX_ATTEMPTS - record.attempts,
+    });
+  }
+
+  // ✓ Correct — mark phone as verified in Supabase
+  otpStore.delete(phone);
+
+  try {
+    const { error: dbErr } = await supabase
+      .from("profiles")
+      .update({ phone_verified: true, phone: phone })
+      .eq("id", userId);
+
+    if (dbErr) {
+      console.error("[OTP] Failed to update profile:", dbErr.message);
+      return res.status(500).json({ error: "Verified, but failed to save. Please contact support." });
+    }
+
+    console.log(`[OTP] Phone verified for user ${userId} (${phone})`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[OTP] DB error:", err.message);
+    res.status(500).json({ error: "Server error. Please try again." });
   }
 });
 
