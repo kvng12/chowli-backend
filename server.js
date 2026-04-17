@@ -53,9 +53,18 @@ app.use(cors({
 
 // ── API key authentication ────────────────────────────────────
 // Every request must include the header: x-api-key: <BACKEND_API_SECRET>
-// Exception: GET / (health check, used by Railway uptime monitor)
+// Exempt routes (called by external services that can't send the header):
+//   GET  /               — Railway health check / uptime monitor
+//   POST /webhooks/twilio   — Twilio WhatsApp reply webhook
+//   POST /webhooks/paystack — Paystack payment callback
+const AUTH_EXEMPT = [
+  { method: "GET",  path: "/" },
+  { method: "POST", path: "/webhooks/twilio" },
+  { method: "POST", path: "/webhooks/paystack" },
+];
 app.use((req, res, next) => {
-  if (req.method === "GET" && req.path === "/") return next();
+  const exempt = AUTH_EXEMPT.some(r => r.method === req.method && r.path === req.path);
+  if (exempt) return next();
 
   const secret = process.env.BACKEND_API_SECRET;
   if (!secret) {
