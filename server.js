@@ -625,6 +625,54 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
+// Auto-release delivered orders after the 2-hour confirmation window.
+// Runs every 5 minutes. Calls the auto_release_orders() Postgres function
+// which sets confirmed_at + status='completed' for eligible orders,
+// then sends a push notification to each affected customer.
+cron.schedule("*/5 * * * *", async () => {
+  console.log("[cron/auto-release] checking for expired delivery confirmation windows");
+
+  // Call the DB function — returns rows of released_order_id
+  const { data: released, error } = await supabase.rpc("auto_release_orders");
+
+  if (error) {
+    console.error("[cron/auto-release] RPC error:", error.message);
+    return;
+  }
+
+  if (!released?.length) {
+    console.log("[cron/auto-release] no orders to release");
+    return;
+  }
+
+  console.log(`[cron/auto-release] released ${released.length} order(s)`);
+
+  // Send push notification to each customer
+  for (const row of released) {
+    const orderId = row.released_order_id;
+    try {
+      const { data: order } = await supabase
+        .from("orders")
+        .select("customer_id, profiles(fcm_token, full_name)")
+        .eq("id", orderId)
+        .single();
+
+      const fcmToken = order?.profiles?.fcm_token;
+      if (fcmToken) {
+        await sendPushNotification({
+          token: fcmToken,
+          title: "Order auto-confirmed ✓",
+          body:  "Your delivery was auto-confirmed after 2 hours. Payment released to the restaurant.",
+          data:  { type: "order_status", order_id: String(orderId), status: "completed" },
+        });
+        console.log(`[cron/auto-release] notified customer for order ${orderId}`);
+      }
+    } catch (notifyErr) {
+      console.error(`[cron/auto-release] notification failed for ${orderId}:`, notifyErr.message);
+    }
+  }
+});
+
 // ════════════════════════════════════════════════════════════
 //  START
 // ════════════════════════════════════════════════════════════
