@@ -48,8 +48,30 @@ app.use(cors({
     "http://localhost:4173",
   ],
   methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type", "x-chowli-secret"],
+  allowedHeaders: ["Content-Type", "x-api-key"],
 }));
+
+// ── API key authentication ────────────────────────────────────
+// Every request must include the header: x-api-key: <BACKEND_API_SECRET>
+// Exception: GET / (health check, used by Railway uptime monitor)
+app.use((req, res, next) => {
+  if (req.method === "GET" && req.path === "/") return next();
+
+  const secret = process.env.BACKEND_API_SECRET;
+  if (!secret) {
+    // If env var is not configured, log a warning but don't block (dev fallback)
+    console.warn("[auth] BACKEND_API_SECRET is not set — API key check skipped");
+    return next();
+  }
+
+  const provided = req.headers["x-api-key"];
+  if (!provided || provided !== secret) {
+    console.warn(`[auth] Unauthorized request: ${req.method} ${req.path} — key=${provided ? "wrong" : "missing"}`);
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  next();
+});
 
 // ── Supabase admin client (bypasses RLS) ─────────────────────
 const supabase = createClient(
