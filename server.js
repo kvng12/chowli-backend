@@ -182,8 +182,41 @@ app.post("/webhooks/paystack", async (req, res) => {
     // Update payment status
     await supabase
       .from("orders")
-      .update({ payment_status: "paid", status: "confirmed" })
+      .update({
+        payment_status: "paid",
+        status: "confirmed",
+        payment_held: true
+      })
       .eq("id", order.id);
+
+    // Create escrow ledger row — audit trail for money held by
+    // Paystack on restaurant's behalf until customer confirms receipt
+    const platformFee = 0; // Free during launch period
+    const netAmount = amount - platformFee;
+
+    const { error: escrowError } = await supabase
+      .from("escrow_ledger")
+      .insert({
+        order_id: order.id,
+        restaurant_id: order.restaurant_id,
+        gross_amount: amount,
+        platform_fee: platformFee,
+        amount: netAmount,
+      });
+
+    if (escrowError) {
+      console.error(
+        "Failed to create escrow row for order",
+        order.id,
+        escrowError
+      );
+      // Do NOT fail the webhook — Paystack will retry if we 500,
+      // and the order IS paid. Log loudly so we can reconcile manually.
+    } else {
+      console.log(
+        `✓ Escrow row created for order ${order.id} — ₦${netAmount}`
+      );
+    }
 
     console.log(`✓ Payment verified for order ${order.id} — ₦${amount}`);
 
